@@ -2,3 +2,4 @@
 node_modules/
 *.log
 .harness-mate-trace.log
+dist/
