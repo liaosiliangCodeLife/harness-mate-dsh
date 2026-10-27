@@ -1,6 +1,6 @@
 {
   "name": "harness-mate",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "DeepSeek Harness (dsh) plugin: connect the agent running on your own computer to HarnessMate — use it from your phone or browser (chat, files, approvals).",
   "type": "module",
   "main": "index.js",

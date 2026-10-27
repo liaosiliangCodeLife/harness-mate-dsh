@@ -886,6 +886,22 @@ export function apply(ctx, config) {
 
     log(`收到消息 peer=${from} thread=${threadId}: ${JSON.stringify(text.slice(0, 60))}${inboundFile.url ? ' [含文件]' : ''}`);
 
+    // ★ 审批决策：#approval <approval_id> <option_id>，命中后回调 resolver，不投给 agent
+    const approvalMatch = text.match(/^#approval\s+(\S+)\s+(allow-once|reject-once)\s*$/);
+    if (approvalMatch) {
+      const approvalId = approvalMatch[1];
+      const optionId = approvalMatch[2];
+      const resolver = approvals.get(approvalId);
+      if (!resolver) {
+        warn(`审批决策找不到对应请求: ${approvalId}`);
+        return;
+      }
+      const decision = optionId === 'allow-once' ? 'approve' : 'reject';
+      log(`审批决策 approval_id=${approvalId} decision=${decision}`);
+      resolver(decision);
+      return;
+    }
+
     // ★ 若该会话有等待中的提问（ask_user_question），本条文本消息优先作为回答注入（不进对话队列，
     //   避免与"挂起等待回答中的轮次"在串行队列中相互死锁）。
     const openQ = openQuestions.get(`${accountId}:${threadId}`);
