@@ -156,7 +156,7 @@ Agent 的默认工作目录是你的用户主目录（`~` / `C:\Users\你的用�
            gatewayUrl: 'wss://ws-agent.alltman.com:1443/ws'
            botId: '你的 bot_id'
            botKey: '你的 bot_key'
-           accountId: 'dsh-account'
+           accountId: '你的平台账号 uuid（可选，仅兜底）'
            dmPolicy: 'open'
            workspace: '你的主目录绝对路径'
    ```

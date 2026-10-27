@@ -75,7 +75,7 @@ const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
 
 // ── 文件传输（协议 §5.3 入站 / §6.3 出站）──
-// 出站：本地文件先 POST 上传到网关 open-api（multipart: bot_id/bot_key/session_id/file），
+// 出站：本地文件先 POST 上传到网关 open-api（multipart: bot_id/bot_key/thread_id/file），
 //       再把返回的可访问 url + file_name + media_type 作为 reply 发出，手机端即可下载/预览。
 // 入站：消息可能带 url（协议字段）或文本里的文件链接（App 会把文件拼成 markdown 链接），
 //       下载到本地后把路径告诉 agent（agent 用 read/read_image 等工具处理）。
@@ -307,7 +307,9 @@ export function apply(ctx, config) {
   }
 
   /** 上传本地文件到网关 open-api（免授权接口，协议 §6.3），返回可访问 url */
-  async function uploadToGateway(filePath, peer) {
+  async function uploadToGateway(filePath, threadId) {
+    const tid = String(threadId ?? '').trim();
+    if (!tid) throw new Error('thread_id 不能为空');
     const name = cleanLocalName(filePath);
     const ext = fileExtOf(name);
     if (!UPLOAD_ALLOWED_EXT.has(ext)) throw new Error(`扩展名 .${ext || '(无)'} 不在网关允许列表`);
@@ -318,7 +320,7 @@ export function apply(ctx, config) {
     const form = new FormData();
     form.append('bot_id', String(CFG.botId ?? ''));
     form.append('bot_key', String(CFG.botKey ?? ''));
-    form.append('session_id', String(peer ?? ''));       // 协议：上传 session_id 用当前对端 ws_session_id
+    form.append('thread_id', tid);                      // 平台用 Conversation.thread_id 定位会话（必填）
     form.append('file', new Blob([buf]), name);
     const res = await fetch(CFG.uploadUrl ?? DEFAULT_UPLOAD_URL, {
       method: 'POST',
@@ -334,12 +336,49 @@ export function apply(ctx, config) {
     return url;
   }
 
+  /** ws_session_id(peer) → 该 peer 最近的业务身份，用于回信路由（§7.1） */
+  const replyTargets = new Map();   // `${accountId}:${threadId}` → peerSession
+  const peerByDevice = new Map();   // from_device → peerSession
+  let lastPeer = '';
+
+  /** 去重（§9.2：重复 msg_id 忽略） */
+  const seen = new Set();
+
+  /** agent → 当前这一轮的回复上下文 */
+  const ownedAgents = new Map();    // agent → { peerSession, accountId, threadId, messageId, mux }
+  /** approvalId → resolver */
+  const approvals = new Map();
+  let approvalSeq = 1;
+
+  /**
+   * 解析上传所需的 thread_id（对齐 Hermes 0.6.2 出站兜底）：
+   *   入参 threadId → ownedAgents 同 peer 的 threadId → replyTargets 反查。
+   */
+  function resolveThreadId(peer, threadId) {
+    const direct = String(threadId ?? '').trim();
+    if (direct) return direct;
+    for (const value of ownedAgents.values()) {
+      if (value?.peerSession === peer) {
+        const tid = String(value.threadId ?? '').trim();
+        if (tid) return tid;
+      }
+    }
+    for (const [key, value] of replyTargets.entries()) {
+      if (value !== peer) continue;
+      const i = key.indexOf(':');
+      if (i < 0) continue;
+      const tid = key.slice(i + 1).trim();
+      if (tid) return tid;
+    }
+    return '';
+  }
+
   /**
    * 每轮结束后把本轮的交付文件发给手机：
    *   ① session 事件里的 deliverables/presented（present 工具显式声明的交付物，主通道）；
    *   ② 回复文本里指向本地文件的 markdown 链接（兜底，仅收录本轮新写入/修改的文件）。
    */
-  async function deliverRoundFiles({ agent, peer, threadId, startSeq, roundStartMs, roundText }) {
+  async function deliverRoundFiles({ agent, peer, threadId, accountId, startSeq, roundStartMs, roundText }) {
     try {
       const cwd = agent.session?.header?.cwd ?? CFG.workspace ?? process.cwd();
       const found = new Map();   // absPath → { description, explicit }
@@ -381,7 +420,9 @@ export function apply(ctx, config) {
           const st = statSync(abs, { throwIfNoEntry: false });
           if (!st?.isFile()) continue;
           if (!meta.explicit && st.mtimeMs < roundStartMs - 1000) continue;   // 兜底通道只发本轮新文件
-          const url = await uploadToGateway(abs, peer);
+          const tid = resolveThreadId(peer, threadId);
+          if (!tid) { warn(`发送文件失败 ${abs}: 拿不到 thread_id`); continue; }
+          const url = await uploadToGateway(abs, tid);
           const name = cleanLocalName(abs);
           sendReply(peer, threadId, {
             text: meta.description || '',
@@ -391,7 +432,7 @@ export function apply(ctx, config) {
             media_type: mediaKindFor(name),
             delta: true,
             done: true,
-          });
+          }, accountId);
           sent++;
           log(`已发送文件到手机：${name}`);
           trace(`出站文件 ${abs} → ${url}`);
@@ -403,20 +444,6 @@ export function apply(ctx, config) {
       trace('deliverRoundFiles 异常: ' + (e?.message ?? e));
     }
   }
-
-  /** ws_session_id(peer) → 该 peer 最近的业务身份，用于回信路由（§7.1） */
-  const replyTargets = new Map();   // `${accountId}:${threadId}` → peerSession
-  const peerByDevice = new Map();   // from_device → peerSession
-  let lastPeer = '';
-
-  /** 去重（§9.2：重复 msg_id 忽略） */
-  const seen = new Set();
-
-  /** agent → 当前这一轮的回复上下文 */
-  const ownedAgents = new Map();    // agent → { peerSession, accountId, threadId, messageId, mux }
-  /** approvalId → resolver */
-  const approvals = new Map();
-  let approvalSeq = 1;
 
   /**
    * 等待用户回答的 agent 提问（ask_user_question）：
@@ -444,11 +471,11 @@ export function apply(ctx, config) {
     return true;
   }
 
-  /** 发 reply（§6） */
-  function sendReply(peer, threadId, payload) {
+  /** 发 reply（§6）；accountId 优先用入站真实账号，缺省回落到配置 */
+  function sendReply(peer, threadId, payload, accountId) {
     return sendEnvelope(peer, {
       type: TYPE_REPLY,
-      account_id: CFG.accountId,
+      account_id: accountId || CFG.accountId,
       thread_id: threadId ?? '',
       data: payload,
     });
@@ -460,7 +487,7 @@ export function apply(ctx, config) {
    * 这里累积全文 —— adapter.py 的 edit_message 语义是"当前累计正文"，
    * 所以每帧发累计文本，最后一帧 done=true。
    */
-  function makeStream(peer, threadId, messageId) {
+  function makeStream(peer, threadId, messageId, accountId) {
     let acc = '';
     let timer = null;
     let finished = false;
@@ -478,7 +505,7 @@ export function apply(ctx, config) {
         message_id: messageId,
         delta: true,
         ...(final ? { done: true } : {}),
-      });
+      }, accountId);
       if (final) finished = true;
     };
 
@@ -499,12 +526,12 @@ export function apply(ctx, config) {
   }
 
   const typingLast = new Map();   // `${peer}:${threadId}` → ts
-  function sendTyping(peer, threadId) {
+  function sendTyping(peer, threadId, accountId) {
     const key = `${peer}:${threadId}`;
     const now = Date.now();
     if (now - (typingLast.get(key) ?? 0) < (CFG.typingThrottleMs ?? 8000)) return;
     typingLast.set(key, now);
-    sendReply(peer, threadId, { status: 'thinking', text: '思考中...' });
+    sendReply(peer, threadId, { status: 'thinking', text: '思考中...' }, accountId);
   }
 
   // ───────────────────────── 访问控制（§3.1）─────────────────────────
@@ -622,7 +649,7 @@ export function apply(ctx, config) {
       question: { call_id: callId, questions },
       delta: true,
       done: true,
-    });
+    }, round.accountId);
 
     return new Promise((resolve, reject) => {
       // 超时/取消不自己造：官方 TimedQuestionWait 在"无 Client 认领"时自带 deadline 定时器
@@ -680,7 +707,7 @@ export function apply(ctx, config) {
         ],
         expires_in_ms: CFG.approvalTimeoutMs ?? 300000,
       },
-    });
+    }, round.accountId);
 
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -818,8 +845,8 @@ export function apply(ctx, config) {
    */
   async function handlePrompt({ peer, accountId, threadId, text, inboundFile }) {
     const messageId = cryptoRandomId();
-    const stream = makeStream(peer, threadId, messageId);
-    sendTyping(peer, threadId);
+    const stream = makeStream(peer, threadId, messageId, accountId);
+    sendTyping(peer, threadId, accountId);
 
     // ★ 入站文件：协议字段 url 或 App 拼进文本的文件链接 → 下载到本地，路径交给 agent
     let agentText = text;
@@ -863,7 +890,7 @@ export function apply(ctx, config) {
       await agent.whenIdle?.();                     // 等本轮结束
       stream.finish();
       // ★ 把本轮的交付文件发给手机（present 事件 + 文本链接），失败不影响主流程
-      await deliverRoundFiles({ agent, peer, threadId, startSeq, roundStartMs, roundText: stream.getText() });
+      await deliverRoundFiles({ agent, peer, threadId, accountId, startSeq, roundStartMs, roundText: stream.getText() });
       // 立即把会话刷盘，保证聊天记录可靠落盘（headless 同款做法）
       try { await ctx.get?.('sessions')?.flush?.(agent.session); } catch (e) { trace('sessions.flush 失败: ' + (e?.message ?? e)); }
       log(`本轮完成 peer=${peer} thread=${threadId}`);
@@ -875,7 +902,7 @@ export function apply(ctx, config) {
         message_id: messageId,
         delta: true,
         done: true,
-      });
+      }, accountId);
     } finally {
       if (round?.agent && ownedAgents.get(round.agent) === round) ownedAgents.delete(round.agent);
     }

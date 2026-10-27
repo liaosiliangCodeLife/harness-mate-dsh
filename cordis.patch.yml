@@ -22,6 +22,8 @@
         botKey: 'REPLACE_WITH_YOUR_BOT_KEY'
 
         # ── 业务身份（§2.2）──
+        # 回复帧的 account_id 现在优先取入站消息里的真实账号，这一项只在入站缺字段时兜底；
+        # 仍建议填成平台账号 uuid，避免兜底到示例值导致前端收不到回复
         accountId: 'dsh-account'
 
         # ── 访问控制（§3.1）──
