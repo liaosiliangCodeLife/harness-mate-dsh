@@ -730,15 +730,20 @@ export function apply(ctx, config) {
   ctx.on('approval/request', (request, next) => {
     const agent = request?.agent;
     const round = agent ? ownedAgents.get(agent) : undefined;
-    // 诊断留痕：DSH 的 GUI 应答者若排在前面会先吃掉请求，所以本监听器必须 prepend 到最前
-    trace(`approval/request 触发: hasAgent=${Boolean(agent)} matched=${Boolean(round)} title=${request?.title ?? request?.toolName ?? ''}`);
+    // 诊断留痕：先打真实字段名（DSH 各版本不一致，别猜）；GUI 应答者若排前会先吃掉，必须 prepend
+    const requestKeys = request && typeof request === 'object' ? Object.keys(request) : [];
+    trace(
+      `approval/request 触发: hasAgent=${Boolean(agent)} matched=${Boolean(round)}`
+      + ` keys=[${requestKeys.join(',')}]`
+      + ` title=${request?.title ?? request?.toolName ?? ''}`,
+    );
     if (!round) return next();                           // 非本插件会话 → 交给下游（GUI 弹窗）
 
     const approvalId = `a-${approvalSeq++}`;
     // 平台侧要靠 action / risk_level / payload_digest 落库、路由与防篡改校验
     const meta = buildApprovalMeta(request);
-    const title = meta.title || request.title || request.toolName || request.callId || '需要授权的操作';
-    log(`审批 ${approvalId}: ${title}`);
+    const title = meta.title || request.title || request.reason || request.toolName || request.callId || '需要授权的操作';
+    log(`审批 ${approvalId}: action=${meta.action} risk=${meta.risk_level} digest=${meta.payload_digest} title=${title}`);
 
     round.stream.push(`\n⚠️ 需要授权：${title}\n`);
 

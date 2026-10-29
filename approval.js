@@ -135,11 +135,16 @@ export function buildTitle(action, payload, fallback) {
  */
 export function buildApprovalMeta(request) {
   const toolName = pickToolName(request);
-  const args = pickArgs(request);
+  const args = { ...pickArgs(request) };
+  // 官方 ApprovalService.request 只保证 agent/toolName/callId/reason/signal，
+  // 不一定带 toolArgs；shell 类在无 command 时用 reason 兜底进 payload.cmd
+  if (!args.command && !args.cmd && !args.script && request?.reason) {
+    args.command = String(request.reason);
+  }
   const { action, risk_level } = resolveAction(toolName);
   const payload = buildPayload(action, args);
   const payload_digest = computePayloadDigest(payload);
-  const fallbackTitle = request?.title ?? toolName;
+  const fallbackTitle = request?.title || request?.reason || toolName;
   const title = buildTitle(action, payload, fallbackTitle);
   return { action, risk_level, payload, payload_digest, title, tool: toolName };
 }
