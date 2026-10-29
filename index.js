@@ -485,6 +485,7 @@ export function apply(ctx, config) {
       type: TYPE_REPLY,
       account_id: accountId || CFG.accountId,
       thread_id: threadId ?? '',
+      bot_id: CFG.botId ?? '',          // 平台据此在房间里定位是哪个 agent 回的话
       data: payload,
     };
     // P3：房间消息的回包必须带回 room_id + 原 message_id，平台才能把回复归到房间
