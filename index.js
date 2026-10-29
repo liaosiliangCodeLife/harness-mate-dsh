@@ -31,6 +31,7 @@ import { basename, isAbsolute, join } from 'node:path';
 // 变量（否则整轮 prompt 组装报 "prompt variable {{model}} has no value"），
 // 并在 agent/request 时带上 provider/model。不加它会得到空回复。
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
+import { buildApprovalMeta } from './approval.js';
 
 export const name = 'harness-mate';
 
@@ -696,7 +697,9 @@ export function apply(ctx, config) {
     if (!round) return next();                           // 非本插件会话 → 交给下游（GUI 弹窗）
 
     const approvalId = `a-${approvalSeq++}`;
-    const title = request.title ?? request.toolName ?? request.callId ?? '需要授权的操作';
+    // 平台侧要靠 action / risk_level / payload_digest 落库、路由与防篡改校验
+    const meta = buildApprovalMeta(request);
+    const title = meta.title || request.title || request.toolName || request.callId || '需要授权的操作';
     log(`审批 ${approvalId}: ${title}`);
 
     round.stream.push(`\n⚠️ 需要授权：${title}\n`);
@@ -707,6 +710,9 @@ export function apply(ctx, config) {
       approval: {
         approval_id: approvalId,
         title,
+        action: meta.action,
+        risk_level: meta.risk_level,
+        payload_digest: meta.payload_digest,
         options: [
           { option_id: 'allow-once', kind: 'allow_once', name: '允许一次' },
           { option_id: 'reject-once', kind: 'reject_once', name: '拒绝' },

@@ -1,52 +1,18 @@
 {
   "name": "harness-mate",
-  "version": "0.2.5",
-  "description": "DeepSeek Harness (dsh) plugin: connect the agent running on your own computer to HarnessMate — use it from your phone or browser (chat, files, approvals).",
+  "version": "0.2.6",
+  "private": true,
+  "description": "把 DSH（DeepSeek Harness）接入 HarnessMate 平台 —— 本机 Agent 的手机/浏览器入口（消息、文件、问答全打通）。平台项目：https://github.com/liaosiliangCodeLife/harness-mate-plat",
+  "icon": "icon.svg",
+  "homepage": "https://github.com/liaosiliangCodeLife/harness-mate-plat",
   "type": "module",
   "main": "index.js",
-  "icon": "icon.svg",
-  "license": "MIT",
-  "author": "liaosiliangCodeLife <liaosiliang1234@126.com>",
-  "homepage": "https://github.com/liaosiliangCodeLife/harness-mate-dsh#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/liaosiliangCodeLife/harness-mate-dsh.git"
-  },
-  "bugs": {
-    "url": "https://github.com/liaosiliangCodeLife/harness-mate-dsh/issues"
-  },
-  "keywords": [
-    "dsh",
-    "dsh-plugin",
-    "deepseek-harness",
-    "deepseek",
-    "cordis",
-    "agent",
-    "mobile",
-    "remote",
-    "harness-mate"
-  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
-  "files": [
-    "index.js",
-    "cordis.patch.yml",
-    "icon.svg",
-    "locale",
-    "install.sh",
-    "install.ps1",
-    "INSTALL.md",
-    "README.md",
-    "README.zh.md",
-    "LICENSE"
-  ],
-  "engines": {
-    "node": ">=22.19.0"
-  },
   "peerDependencies": {
-    "@deepseek-ai/dsh-agent": "*"
+    "@deepseek-ai/dsh-agent": "workspace:^"
   }
 }
