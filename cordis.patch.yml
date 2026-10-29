@@ -32,6 +32,10 @@
 
         # ── 行为 ──
         approvalTimeoutMs: 300000   # 审批超时 → 按拒绝处理
+        # 审批轮询平台（与 Hub 回写 /internal/messages 配套）：
+        # apiBaseUrl: 'https://harness.alltman.com/api'   # 缺省从 uploadUrl 推导
+        # internalToken: '与平台 INTERNAL_TOKEN 一致'      # 不填则只靠本地超时/GUI
+        # agentId: '智能体 UUID（可选；缺省用 botId 查）'
         typingThrottleMs: 8000      # 协议 §10：思考状态 8s 节流
         flushIntervalMs: 700        # 流式分片间隔
         flushChars: 1200            # 或累积到多少字符即发

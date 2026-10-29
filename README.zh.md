@@ -91,6 +91,9 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | `workspace` | 用户主目录 | 智能体可读写的根目录 |
 | `dmPolicy` | `open` | `open` · `allowlist`（配合 `allowFrom`）· `disabled` |
 | `approvalTimeoutMs` | `300000` | 工具审批超时（超时按拒绝处理） |
+| `apiBaseUrl` | 从 `uploadUrl` 推导 | 平台 HTTP API 根（含 `/api`），审批轮询用 |
+| `internalToken` | — | 与平台 `INTERNAL_TOKEN` 一致；不填无法轮询审批决策 |
+| `agentId` | — | 智能体 UUID；缺省用 `botId` 查询 |
 | `maxReplyChars` | `4000` | 单条回复最大字符数 |
 | `forwardReasoning` | `false` | 是否把思考过程也发到聊天里 |
 

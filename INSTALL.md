@@ -172,6 +172,9 @@ Agent 的默认工作目录是你的用户主目录（`~` / `C:\Users\你的用�
 | `workspace` | 你的主目录 | Agent 工作目录（读写文件的根） |
 | `dmPolicy` | `open` | `open` 谁都能发消息；`allowlist` 仅白名单（配合 `allowFrom: ['对端 ws_session_id']`）；`disabled` 停用 |
 | `approvalTimeoutMs` | `300000` | 高危操作审批超时（毫秒），超时按拒绝处理 |
+| `apiBaseUrl` | 从 `uploadUrl` 推导 | 平台 HTTP API 根（含 `/api`），审批轮询用 |
+| `internalToken` | （空） | 与平台 `INTERNAL_TOKEN` 一致；不填则审批只靠本地超时/GUI，无法轮询决策 |
+| `agentId` | （空） | 智能体 UUID；缺省用 `botId` 查 |
 | `typingThrottleMs` | `8000` | 「思考中」状态节流 |
 | `maxReplyChars` | `4000` | 单条回复最大字符数 |
 | `forwardReasoning` | `false` | 是否把思考过程也发到聊天里 |

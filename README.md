@@ -91,6 +91,9 @@ Every field lives under `config` in the plugin's `cordis.patch.yml`; change them
 | `workspace` | your home directory | Root directory the agent may read and write |
 | `dmPolicy` | `open` | `open` · `allowlist` (with `allowFrom`) · `disabled` |
 | `approvalTimeoutMs` | `300000` | Tool-approval timeout; a timeout is treated as a denial |
+| `apiBaseUrl` | derived from `uploadUrl` | Platform HTTP API root (incl. `/api`) for approval polling |
+| `internalToken` | — | Must match platform `INTERNAL_TOKEN`; without it polling is disabled |
+| `agentId` | — | Agent UUID; defaults to lookup by `botId` |
 | `maxReplyChars` | `4000` | Maximum length of a single reply |
 | `forwardReasoning` | `false` | Also forward the agent's reasoning to the chat |
 
