@@ -344,6 +344,8 @@ export function apply(ctx, config) {
 
   /** ws_session_id(peer) → 该 peer 最近的业务身份，用于回信路由（§7.1） */
   const replyTargets = new Map();   // `${accountId}:${threadId}` → peerSession
+  // P3：房间上下文（入站帧带 room_id 时记录，出站回包原样带回，平台据此把回复落回房间）
+  const roomCtx = new Map();        // `${peer}:${threadId}` → { roomId, replyTo }
   const peerByDevice = new Map();   // from_device → peerSession
   let lastPeer = '';
 
@@ -479,12 +481,23 @@ export function apply(ctx, config) {
 
   /** 发 reply（§6）；accountId 优先用入站真实账号，缺省回落到配置 */
   function sendReply(peer, threadId, payload, accountId) {
-    return sendEnvelope(peer, {
+    const envelope = {
       type: TYPE_REPLY,
       account_id: accountId || CFG.accountId,
       thread_id: threadId ?? '',
       data: payload,
-    });
+    };
+    // P3：房间消息的回包必须带回 room_id + 原 message_id，平台才能把回复归到房间
+    const room = roomCtx.get(`${peer}:${threadId ?? ''}`);
+    if (room?.roomId) {
+      envelope.room_id = room.roomId;
+      envelope.reply_to = room.replyTo ?? '';
+      if (envelope.data && typeof envelope.data === 'object') {
+        envelope.data.room_id = room.roomId;
+        envelope.data.reply_to = room.replyTo ?? '';
+      }
+    }
+    return sendEnvelope(peer, envelope);
   }
 
   // ───────────────────────── 流式分片 ─────────────────────────
@@ -884,6 +897,13 @@ export function apply(ctx, config) {
 
     const accountId = String(data.account_id ?? CFG.accountId);
     const threadId = String(data.thread_id ?? '');
+    // P3：房间消息（平台按 target_agent_ids 下发时会带 room_id + message_id）
+    const roomId = String(data.room_id ?? nested.room_id ?? '').trim();
+    const roomMessageId = String(data.message_id ?? nested.message_id ?? '').trim();
+    if (roomId) {
+      roomCtx.set(`${from}:${threadId}`, { roomId, replyTo: roomMessageId });
+      trace(`房间消息 room_id=${roomId} reply_to=${roomMessageId}`);
+    }
     const deviceId = String(data.from_device ?? data.device_id ?? from);
 
     // §7：记录回复目标
