@@ -712,21 +712,6 @@ export function apply(ctx, config) {
     });
   }, { prepend: true });
 
-  /** 推导平台 HTTP API 根地址（含 /api），供审批轮询 */
-  function resolveApiBase() {
-    const explicit = String(CFG.apiBaseUrl || '').trim().replace(/\/$/, '');
-    if (explicit) return explicit;
-    const upload = String(CFG.uploadUrl || DEFAULT_UPLOAD_URL);
-    try {
-      const u = new URL(upload);
-      const idx = u.pathname.indexOf('/api');
-      if (idx >= 0) return `${u.origin}${u.pathname.slice(0, idx + 4)}`;
-      return `${u.origin}/api`;
-    } catch {
-      return 'https://harness.alltman.com/api';
-    }
-  }
-
   // ───────────────────────── ③ 拦截审批 ─────────────────────────
   ctx.on('approval/request', (request, next) => {
     const agent = request?.agent;
@@ -767,19 +752,12 @@ export function apply(ctx, config) {
 
     return new Promise((resolve) => {
       let settled = false;
-      let poll = null;
       const timeoutMs = CFG.approvalTimeoutMs ?? 300000;
-      const deadline = Date.now() + timeoutMs;
-      const apiBase = resolveApiBase();
-      const internalToken = String(CFG.internalToken || '').trim();
-      const agentKey = String(CFG.agentId || '').trim();
-      const botKey = String(CFG.botId || '').trim();
 
       const finish = (decision) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        if (poll) clearInterval(poll);
         approvals.delete(approvalId);
         log(`审批 ${approvalId} → ${decision}`);
         resolve(decision);
@@ -790,40 +768,11 @@ export function apply(ctx, config) {
         finish('rejected');
       }, timeoutMs);
 
-      // GUI / 其它通道仍可通过 approvals Map resolve —— 谁先到用谁
+      // 平台点「允许/拒绝」后经 WS 下发 approval_result 帧（handleApprovalResult）resolve；
+      // GUI 等其它通道也写这个 Map，谁先到用谁。插件只需要 bot_id + bot_key。
       approvals.set(approvalId, (decision) => {
         finish(decision === 'approve' ? 'allowed-once' : 'rejected');
       });
-
-      // 轮询平台：Hub 把 approval 帧回写后落库，Owner 批准/拒绝后这里拿到 status
-      poll = setInterval(async () => {
-        if (settled) return;
-        if (Date.now() > deadline) {
-          warn(`审批 ${approvalId} 轮询超时 → 拒绝`);
-          finish('rejected');
-          return;
-        }
-        if (!internalToken) {
-          // 未配置令牌时只靠本地 Map / 超时，避免无意义 403 刷屏
-          return;
-        }
-        try {
-          const qs = new URLSearchParams({ client_approval_id: approvalId });
-          if (agentKey) qs.set('agent_id', agentKey);
-          else if (botKey) qs.set('bot_id', botKey);
-          else return;
-          const r = await fetch(`${apiBase}/internal/approvals/lookup?${qs}`, {
-            headers: { 'X-Internal-Token': internalToken, Accept: 'application/json' },
-            signal: AbortSignal.timeout(8000),
-          });
-          const j = await r.json();
-          const st = j?.data?.status;
-          if (st === 1) finish('allowed-once');
-          else if (st === 2 || st === 3) finish('rejected');
-        } catch (e) {
-          trace(`审批轮询失败 ${approvalId}: ${e?.message ?? e}`);
-        }
-      }, 2000);
     });
   }, { prepend: true });   // 必须排在 DSH GUI 应答者之前，否则请求会被 GUI 先吃掉
 
