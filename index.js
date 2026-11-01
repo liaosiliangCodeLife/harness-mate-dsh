@@ -71,6 +71,7 @@ trace('module imported (bundle 已被加载)');
 // 将来若需 schema 校验：用 Schema.object（Cordis 自带）或从 zod 导入 z。
 
 const TYPE_MESSAGE = 'message';
+const TYPE_APPROVAL_RESULT = 'approval_result';
 const TYPE_REPLY = 'reply';
 const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
@@ -946,11 +947,34 @@ export function apply(ctx, config) {
   }
 
   // ───────────────────────── 入站处理 ─────────────────────────
+  /**
+   * 处理平台下行推送的审批决策帧（approval_result）。
+   * 命中本地等待中的审批请求时立即 resolve，不必等本地超时兜底。
+   */
+  function handleApprovalResult(data) {
+    const result = (data && typeof data.approval_result === 'object' && data.approval_result) || data || {};
+    const approvalId = String(result.approval_id ?? '').trim();
+    const status = Number(result.status);
+    if (!approvalId) { trace('审批决策帧缺 approval_id'); return; }
+    if (!Number.isFinite(status)) { trace('审批决策帧 status 无效: ' + result.status); return; }
+    const resolver = approvals.get(approvalId);
+    if (!resolver) { trace('审批决策找不到对应请求: ' + approvalId); return; }
+    // status 1 通过；2 拒绝 / 3 超时 都按拒绝解阻塞
+    const decision = status === 1 ? 'approve' : 'reject';
+    log(`收到审批决策推送 approval_id=${approvalId} status=${status} decision=${decision}`);
+    resolver(decision);
+  }
+
   async function onGatewayMessage(raw) {
     const from = String(raw?.from ?? '').trim();
     trace('入站: from=' + JSON.stringify(raw?.from) + ' dataType=' + JSON.stringify(raw?.data?.type));
     if (!from) { trace('丢弃: 缺 from'); return; }          // §9.2：缺 from 忽略
     const data = typeof raw.data === 'string' ? safeJson(raw.data) : (raw.data ?? {});
+    // 平台下行的审批决策：命中本地等待立即 resolve，不必等轮询或超时
+    if (data.type === TYPE_APPROVAL_RESULT) {
+      handleApprovalResult(data);
+      return;
+    }
     if (data.type !== TYPE_MESSAGE) { trace('丢弃: type 不是 message，实际=' + data.type); return; }  // §9.2
 
     const nested = typeof data.data === 'string' ? safeJson(data.data) : (data.data ?? {});
