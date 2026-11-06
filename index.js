@@ -927,12 +927,36 @@ export function apply(ctx, config) {
     if (data.type !== TYPE_MESSAGE) { trace('丢弃: type 不是 message，实际=' + data.type); return; }  // §9.2
 
     const nested = typeof data.data === 'string' ? safeJson(data.data) : (data.data ?? {});
-    const text = String(nested.text ?? data.text ?? '').trim();
-    // 文件消息：协议字段 url/file_name（App 也可能把文件拼进文本的 markdown 链接）
-    const inboundFile = {
+    const kind = String(nested.kind ?? data.kind ?? '').trim().toLowerCase();
+    let text = String(nested.text ?? data.text ?? '').trim();
+    // 文件消息：协议字段 url/file_name；群聊也可能是 kind+content(URL)
+    let inboundFile = {
       url: String(nested.url ?? nested.file_url ?? data.url ?? '').trim(),
       name: String(nested.file_name ?? nested.name ?? '').trim(),
     };
+    if (!inboundFile.url) {
+      const content = String(nested.content ?? data.content ?? '').trim();
+      if (
+        ['image', 'file', 'audio', 'video'].includes(kind) &&
+        (content.startsWith('http://') || content.startsWith('https://'))
+      ) {
+        const extra = (nested.extra && typeof nested.extra === 'object')
+          ? nested.extra
+          : ((data.extra && typeof data.extra === 'object') ? data.extra : {});
+        inboundFile = {
+          url: content,
+          name: String(extra.name ?? '').trim(),
+        };
+        // 媒体消息不要把 URL 当用户话术
+        text = String(extra.name ?? '').trim();
+      }
+    } else if (['image', 'file', 'audio', 'video'].includes(kind)) {
+      // 已有 url 但仍带 kind 时，content/text 若是纯 URL 也清空
+      const content = String(nested.content ?? data.content ?? '').trim();
+      if (text === content && (text.startsWith('http://') || text.startsWith('https://'))) {
+        text = inboundFile.name || '';
+      }
+    }
     if (!text && !inboundFile.url) { trace('丢弃: 无文本内容'); return; }   // §9.2：无文本且无文件时忽略
 
     const msgId = String(data.msg_id ?? nested.message_id ?? nested.msg_id ?? '').trim();
