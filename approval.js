@@ -65,6 +65,8 @@ const sha256Hex = (s) => createHash('sha256').update(String(s ?? ''), 'utf8').di
 export function resolveAction(toolName) {
   const name = String(toolName || '').toLowerCase();
   const rules = [
+    // Windows shell 工具名（须在通用 shell 规则之前，避免落到 tool.pwsh + L3）
+    [/(^|[._-])(pwsh|powershell|cmd|ps1|pwsh\.exe|powershell\.exe|cmd\.exe)([._-]|$)/, 'exec.shell', 2],
     [/(^|[._-])(shell|terminal|bash|exec|command)([._-]|$)/, 'exec.shell', 2],
     [/(^|[._-])(delete|remove|rm|unlink|trash)([._-]|$)/, 'fs.delete', 3],
     [/(^|[._-])(write|edit|create|patch|mkdir|append)([._-]|$)/, 'fs.write', 1],
@@ -131,11 +133,21 @@ export function buildTitle(action, payload, fallback) {
 
 /**
  * 主入口：把 DSH 的 approval/request 变成平台需要的审批元数据
+ * @param {object} request DSH approval/request
+ * @param {object} [argsOverride] 外部真实入参（如 snapshotEvents tool/call.arguments）；非空对象时优先
  * @returns {{action:string, risk_level:number, payload:object, payload_digest:string, title:string}}
  */
-export function buildApprovalMeta(request) {
+export function buildApprovalMeta(request, argsOverride) {
   const toolName = pickToolName(request);
-  const args = { ...pickArgs(request) };
+  const fromRequest = pickArgs(request);
+  let args;
+  if (argsOverride && typeof argsOverride === 'object' && !Array.isArray(argsOverride)
+      && Object.keys(argsOverride).length > 0) {
+    // 真实入参优先，再补 request 里缺的键
+    args = { ...fromRequest, ...argsOverride };
+  } else {
+    args = { ...fromRequest };
+  }
   // 官方 ApprovalService.request 只保证 agent/toolName/callId/reason/signal，
   // 不一定带 toolArgs；shell 类在无 command 时用 reason 兜底进 payload.cmd
   if (!args.command && !args.cmd && !args.script && request?.reason) {

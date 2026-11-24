@@ -35,6 +35,37 @@ import { buildApprovalMeta } from './approval.js';
 
 export const name = 'harness-mate';
 
+/** 字面量兜底：DSH 运行副本里 import.meta.url 旁常无 package.json；发版时请同步改这里 */
+const PLUGIN_VERSION_FALLBACK = '0.2.12';
+
+/** 插件版本：每帧 reply 上报；多路径读 package.json，首个成功即用 */
+const PLUGIN_VERSION = (() => {
+  const tryRead = (file) => {
+    try {
+      const v = String(JSON.parse(readFileSync(file, 'utf8')).version ?? '').trim();
+      return v || '';
+    } catch {
+      return '';
+    }
+  };
+  const candidates = [
+    () => {
+      try { return new URL('./package.json', import.meta.url); } catch { return null; }
+    },
+    () => join(process.cwd(), 'package.json'),
+    () => join(process.cwd(), 'plugin', 'dsh', 'package.json'),
+  ];
+  for (const get of candidates) {
+    let pathOrUrl;
+    try { pathOrUrl = get(); } catch { continue; }
+    if (!pathOrUrl) continue;
+    // readFileSync 接受 URL 或 path
+    const v = tryRead(pathOrUrl);
+    if (v) return v;
+  }
+  return PLUGIN_VERSION_FALLBACK;
+})();
+
 // ⚠️ 刻意不声明 inject。
 // 实测（探针 v3）：`agents` 服务在插件加载后约 500ms 才可用，
 // 声明 inject 会让 apply() 一直等待而不执行（实测 apply 从未运行）。
@@ -91,12 +122,13 @@ const UPLOAD_ALLOWED_EXT = new Set([...IMAGE_EXT, ...DOC_EXT, ...AUDIO_EXT, ...V
 const UPLOAD_MAX_PLAIN_BYTES = 16 * 1024 * 1024;      // 普通文件上限（协议）
 const UPLOAD_MAX_MEDIA_BYTES = 1024 * 1024 * 1024;    // 音视频上限（协议）
 const DOWNLOAD_MAX_BYTES = 200 * 1024 * 1024;
-const MAX_FILES_PER_ROUND = 4;
+const MAX_FILES_PER_ROUND = 5;
 
 export function apply(ctx, config) {
   const CFG = config ?? {};
   // trace 落盘位置：显式配置优先，否则 workspace 下（与 state/inbox 同址；HOME 兜底）
   tracePath = CFG.traceFile ?? join(CFG.workspace ?? process.env.HOME ?? process.env.USERPROFILE ?? process.cwd(), '.harness-mate-trace.log');
+  trace('PLUGIN_VERSION=' + JSON.stringify(PLUGIN_VERSION) + ' url=' + (import.meta.url || ''));
   // ⚠️ 教训(实测事故):cordis 的 LoggerService 的 info/warn 方法内部是 `this()[type](...)`,
   // 依赖 this 指向 logger 本身。写成 `(ctx.logger?.info ?? console.log)(...)` 把方法取出来
   // 裸调用会丢 this → 抛 "TypeError: this is not a function" → apply() 直接崩、插件不激活。
@@ -281,34 +313,65 @@ export function apply(ctx, config) {
     const pattern = CFG.fileHostPattern ?? 'myqcloud\\.com|alltman\\.com';
     try { return new RegExp(pattern, 'i').test(new URL(url).host); } catch { return false; }
   }
-  async function inlineInboundFiles(text, inboundFile) {
+  function looksLikeImage(kind, nameOrPath) {
+    if (String(kind ?? '').toLowerCase() === 'image') return true;
+    return /\.(jpe?g|png|gif|webp|bmp|heic)$/i.test(String(nameOrPath ?? ''));
+  }
+
+  /**
+   * 入站附件：下载到 inbox，正文末尾汇总一段本地路径说明。
+   * @param {string} text
+   * @param {null|object|object[]} inboundFiles 兼容 null / 单对象 / 数组
+   */
+  async function inlineInboundFiles(text, inboundFiles) {
     let out = text;
+    const list = Array.isArray(inboundFiles)
+      ? inboundFiles
+      : (inboundFiles && typeof inboundFiles === 'object' ? [inboundFiles] : []);
     const jobs = [];
-    const protoUrl = String(inboundFile?.url ?? '').trim();
-    if (protoUrl) jobs.push({ url: protoUrl, name: inboundFile?.name ?? '' });
+    for (const f of list) {
+      const url = String(f?.url ?? '').trim();
+      if (!url) continue;
+      jobs.push({
+        url,
+        name: String(f?.name ?? '').trim(),
+        kind: String(f?.kind ?? '').trim().toLowerCase(),
+      });
+    }
     for (const m of String(text ?? '').matchAll(MD_LINK_RE)) {
       const url = m[2];
       if (!/^https?:\/\//i.test(url)) continue;      // 只处理上传回来的文件链接
       if (!isOurFileHost(url)) continue;             // 普通网页链接不下载
-      jobs.push({ url, name: m[1] || '' });
+      jobs.push({ url, name: m[1] || '', kind: '' });
     }
     if (!jobs.length) return out;
+
     const seen = new Set();
+    const lines = [];   // 汇总行（成功 / 失败）
+    let okCount = 0;
     for (const job of jobs) {
       if (seen.has(job.url)) continue;
       seen.add(job.url);
+      const displayName = safeFileName(job.name) || job.url;
       try {
         const local = await downloadToInbox(job.url, job.name);
-        const display = cleanLocalName(local);
         // 文本里的链接 → 替换为本地路径（agent 可直接按路径读取）
         if (out.includes(job.url)) {
           out = out.split(`(${job.url})`).join(`(${local})`).split(`(<${job.url}>)`).join(`(${local})`);
         }
-        out += `\n\n（用户通过手机发来了文件「${display}」，已下载到本地：${local}）`;
+        const img = looksLikeImage(job.kind, local) || looksLikeImage(job.kind, job.name);
+        lines.push(img
+          ? `- ${local}（图片，可直接用 read_image / 读图工具打开）`
+          : `- ${local}`);
+        okCount += 1;
       } catch (e) {
         warn(`下载入站文件失败 ${job.url}: ${e?.message ?? e}`);
-        out += `\n\n（用户通过手机发来了一个文件，但下载失败：${e?.message ?? e}）`;
+        lines.push(`- ${displayName}（下载失败：${e?.message ?? e}）`);
       }
+    }
+    // 全部失败或无成功项：不加尾巴；有成功则一段汇总（含失败行）
+    if (okCount > 0 && lines.length) {
+      out += `\n\n（用户通过手机发来了 ${lines.length} 个文件，已下载到：\n${lines.join('\n')}）`;
     }
     return out;
   }
@@ -357,7 +420,6 @@ export function apply(ctx, config) {
   const ownedAgents = new Map();    // agent → { peerSession, accountId, threadId, messageId, mux }
   /** approvalId → resolver */
   const approvals = new Map();
-  let approvalSeq = 1;
 
   /**
    * 解析上传所需的 thread_id（对齐 Hermes 0.6.2 出站兜底）：
@@ -385,15 +447,27 @@ export function apply(ctx, config) {
   /**
    * 每轮结束后把本轮的交付文件发给手机：
    *   ① session 事件里的 deliverables/presented（present 工具显式声明的交付物，主通道）；
-   *   ② 回复文本里指向本地文件的 markdown 链接（兜底，仅收录本轮新写入/修改的文件）。
+   *   ② 回复文本里指向本地文件的 markdown 链接（兜底，仅收录本轮新写入/修改的文件）；
+   *   ③ 正文里的裸绝对路径（Windows `C:\...` 等，受白名单 + mtime + 扩展名 + 单轮上限约束）。
    */
   async function deliverRoundFiles({ agent, peer, threadId, accountId, startSeq, roundStartMs, roundText }) {
     try {
       const cwd = agent.session?.header?.cwd ?? CFG.workspace ?? process.cwd();
       const found = new Map();   // absPath → { description, explicit }
+      const inbox = inboxDir();
+      const workspaceRoot = String(CFG.workspace ?? cwd ?? '').trim();
+      const norm = (p) => String(p ?? '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+      const under = (abs, root) => {
+        const a = norm(abs); const r = norm(root);
+        return !!r && (a === r || a.startsWith(r + '\\'));
+      };
+      // 白名单 = workspace ∪ inbox（inbox 里是用户发来的，允许出现在正文，但不回传）
+      const pathAllowed = (abs) => under(abs, workspaceRoot) || under(abs, inbox);
+      const pathBlocked = (abs) => under(abs, inbox);
       const addFile = (p, description, explicit) => {
         if (!p || typeof p !== 'string' || !p.trim()) return;
         const abs = isAbsolute(p) ? p : join(cwd, p);
+        if (!pathAllowed(abs) || pathBlocked(abs)) return;   // 越界 / 入站附件不回传
         const prev = found.get(abs);
         if (!prev) { found.set(abs, { description: description || '', explicit }); return; }
         if (explicit && !prev.explicit) found.set(abs, { description: description || prev.description || '', explicit: true });
@@ -418,6 +492,20 @@ export function apply(ctx, config) {
           t = t.replace(/^<|>$/g, '').replace(/#L\d+(-L\d+)?$/, '').replace(/:\d+(-\d+)?$/, '');
           if (!/\.[a-z0-9]{1,8}$/i.test(t)) continue;
           addFile(t, m[1] || '', false);
+        }
+      }
+
+      // ③ 正文里的裸绝对路径（Windows `C:\...` / `D:/...`，含中文与空格边界处理）
+      //    闸门：白名单在 addFile 内统一判；mtime 由下面的 !explicit 分支判；扩展名这里先筛一遍
+      if (roundText) {
+        const RAW_ABS_RE = /[A-Za-z]:[\\/][^\s"'`<>|*?，。；：、“”‘’（）【】]+/g;
+        for (const m of roundText.matchAll(RAW_ABS_RE)) {
+          const raw = String(m[0] ?? '').trim().replace(/[.,;:)\]}]+$/, '');
+          if (!raw) continue;
+          if (!/\.[a-z0-9]{1,8}$/i.test(raw)) continue;            // 必须像文件名（带扩展名）
+          const ext = raw.split('.').pop().toLowerCase();
+          if (!UPLOAD_ALLOWED_EXT.has(ext)) continue;              // 只收可上传类型
+          addFile(raw, '', false);
         }
       }
 
@@ -496,7 +584,11 @@ export function apply(ctx, config) {
       account_id: accountId || CFG.accountId,
       thread_id: threadId ?? '',
       bot_id: CFG.botId ?? '',          // 平台据此在房间里定位是哪个 agent 回的话
-      data: payload,
+      data: {
+        ...payload,
+        plugin_version: PLUGIN_VERSION,
+        hermes_version: payload?.hermes_version ?? '',
+      },
     };
     // P3：房间消息的回包必须带回 room_id + 原 message_id，平台才能把回复归到房间
     const room = roomCtx.get(`${peer}:${threadId ?? ''}`);
@@ -511,30 +603,173 @@ export function apply(ctx, config) {
     return sendEnvelope(peer, envelope);
   }
 
+  const cryptoRandomId = () => globalThis.crypto?.randomUUID?.()
+    ?? `m-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  // ───────────────────────── 工具步骤分桶（对标 Hermes）─────────────────────────
+  // 桶键：thread|turn，禁止全局单例累积（多会话并发会串步）
+  const stepBuckets = new Map();   // `${threadId}|${turnId}` → [step...]
+  const MAX_STEPS = 30;
+
+  function recordStep(threadId, turnId, step) {
+    const key = `${threadId ?? ''}|${turnId ?? ''}`;
+    const arr = stepBuckets.get(key) ?? [];
+    arr.push({
+      id: step.id || cryptoRandomId(),
+      event: 'agent_action',
+      thought: '',
+      tool: step.tool || 'tool',
+      tool_input: String(step.input ?? '').slice(0, 500),
+      observation: String(step.observation ?? '').slice(0, 300),
+      latency: Math.round((step.latency ?? 0) * 100) / 100,
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    while (arr.length > MAX_STEPS) arr.shift();
+    stepBuckets.set(key, arr);
+    return arr;
+  }
+
+  function snapshotSteps(threadId, turnId) {
+    return [...(stepBuckets.get(`${threadId ?? ''}|${turnId ?? ''}`) ?? [])];
+  }
+
+  function drainSteps(threadId, turnId) {
+    const key = `${threadId ?? ''}|${turnId ?? ''}`;
+    const arr = stepBuckets.get(key) ?? [];
+    stepBuckets.delete(key);
+    return arr;
+  }
+
+  /** 按 callId 回填 observation / latency；找不到返回 false */
+  function patchStep(threadId, turnId, callId, patch) {
+    const arr = stepBuckets.get(`${threadId ?? ''}|${turnId ?? ''}`);
+    if (!arr) return false;
+    const s = arr.find((x) => x.id === callId);
+    if (!s) return false;
+    if (patch.observation != null) s.observation = String(patch.observation).slice(0, 300);
+    if (patch.latency != null) s.latency = Math.round(Number(patch.latency) * 100) / 100;
+    return true;
+  }
+
+  /** 每步进度帧：空正文 + 全量 tool_events/agent_thoughts，done=false */
+  function pushProgress(peer, threadId, accountId, messageId, turnId) {
+    const snap = snapshotSteps(threadId, turnId);
+    if (!snap.length) return;
+    sendReply(peer, threadId, {
+      text: '',
+      message_id: messageId,
+      status: 'thinking',
+      tool_events: snap,
+      agent_thoughts: snap,
+      done: false,
+    }, accountId);
+  }
+
+  function stopToolPoll(round) {
+    if (round?.toolPoll) {
+      clearInterval(round.toolPoll);
+      round.toolPoll = null;
+    }
+  }
+
+  /**
+   * 1500ms 轮询 session.snapshotEvents：用 tool/result 回填 observation+latency。
+   * 不用订阅 session/event（插件根 ctx 不保证收得到）。
+   */
+  function ensureToolPoll(round) {
+    if (!round || round.toolPoll || round.progressDone) return;
+    round.toolPoll = setInterval(() => {
+      if (round.progressDone) {
+        stopToolPoll(round);
+        return;
+      }
+      try {
+        const events = round.agent?.session?.snapshotEvents?.(round.startSeq) ?? [];
+        const callTimes = new Map(round.toolCallAt ?? []);
+        for (const ev of events) {
+          if (ev?.type !== 'tool/call') continue;
+          const id = ev.data?.callId;
+          if (id && ev.time != null) callTimes.set(id, Number(ev.time));
+        }
+        let updated = false;
+        for (const ev of events) {
+          if (ev?.type !== 'tool/result') continue;
+          const msg = ev.data?.message;
+          const callId = msg?.toolCallId ?? msg?.source?.callId;
+          if (!callId || round.toolFilled?.has(callId)) continue;
+          let obs = '';
+          const content = msg?.content;
+          if (Array.isArray(content)) obs = content.map((c) => c?.text ?? '').join('');
+          else if (typeof content === 'string') obs = content;
+          if (msg?.isError) obs = `[error] ${obs}`;
+          const callTime = callTimes.get(callId) ?? round.toolCallAt?.get(callId) ?? 0;
+          const resultTime = Number(ev.time) || Date.now();
+          const latency = callTime ? resultTime - callTime : 0;
+          if (patchStep(round.threadId, round.messageId, callId, { observation: obs, latency })) {
+            round.toolFilled.add(callId);
+            updated = true;
+          }
+        }
+        if (updated) {
+          pushProgress(
+            round.peerSession,
+            round.threadId,
+            round.accountId,
+            round.messageId,
+            round.messageId,
+          );
+        }
+      } catch (e) {
+        trace('toolPoll 失败: ' + (e?.message ?? e));
+      }
+    }, 1500);
+  }
+
   // ───────────────────────── 流式分片 ─────────────────────────
   /**
-   * 协议 §6.3：message_id 流式多帧共用；delta=true 为增量，done=true 为最终帧。
-   * 这里累积全文 —— adapter.py 的 edit_message 语义是"当前累计正文"，
-   * 所以每帧发累计文本，最后一帧 done=true。
+   * 协议 §6.5：非 done 帧只发新增后缀（delta:true）；done / 群聊发全量。
+   * finish(extra) 可把 tool_events / reasoning 等合并进最终帧。
    */
   function makeStream(peer, threadId, messageId, accountId) {
     let acc = '';
+    let sent = '';                 // 已发送出去的正文基线
     let timer = null;
     let finished = false;
+    // 群聊：正文一律发全量、不带 delta（与 Hermes 一致，避免多端累加不一致）
+    const isRoom = () => !!roomCtx.get(`${peer}:${threadId}`)?.roomId;
 
-    const flush = (final = false) => {
+    const flush = (final = false, extra = {}) => {
       if (timer) { clearTimeout(timer); timer = null; }
       if (finished) return;
       if (!acc && !final) return;
-      const text = acc.slice(0, CFG.maxReplyChars ?? 4000);
-      const trimmed = final && text.length > (CFG.maxReplyChars ?? 4000)
-        ? text.slice(0, CFG.maxReplyChars) + '…（已截断）'
-        : text;
+
+      const limit = CFG.maxReplyChars ?? 4000;
+      const full = acc.slice(0, limit);
+      const truncated = acc.length > limit;
+      let text = '';
+      let delta = false;
+
+      if (final || isRoom()) {
+        // done 帧 / 群聊：发全量
+        text = final && truncated ? full + '…（已截断）' : full;
+        sent = full;
+      } else if (full.startsWith(sent)) {
+        // 正常流式：只发新增后缀
+        text = full.slice(sent.length);
+        sent = full;
+        delta = true;
+      } else {
+        // 内容被重写/回退：发全量重置基线
+        text = full;
+        sent = full;
+      }
+
+      if (!text && !final) return;
       sendReply(peer, threadId, {
-        text: trimmed,
+        text,
         message_id: messageId,
-        delta: true,
-        ...(final ? { done: true } : {}),
+        ...(delta ? { delta: true } : {}),
+        ...(final ? { done: true, ...extra } : {}),
       }, accountId);
       if (final) finished = true;
     };
@@ -548,8 +783,8 @@ export function apply(ctx, config) {
       },
       /** 立即冲刷当前累积文本（非最终帧） */
       flush() { flush(false); },
-      /** 发送最终帧 done=true */
-      finish() { flush(true); },
+      /** 发送最终帧 done=true；extra 合并进 payload（tool_events / reasoning） */
+      finish(extra = {}) { flush(true, extra); },
       /** 本轮累计的完整文本（出站文件解析用） */
       getText: () => acc,
     };
@@ -596,13 +831,43 @@ export function apply(ctx, config) {
       case 'text-delta':                                 // ★ 正文
         round.stream.push(chunk.text ?? '');
         return;
-      case 'reasoning-delta':                            // 推理：默认不发（协议支持 reasoning 字段）
-        if (CFG.forwardReasoning) round.stream.push(chunk.text ?? '');
+      case 'reasoning-delta':                            // 推理：累积到 round.reasoning，done 帧带出；不得进正文
+        if (CFG.forwardReasoning) {
+          round.reasoning = (round.reasoning || '') + (chunk.text ?? '');
+        }
         return;
       case 'block-start':
-      case 'block-end':
         return;
+      case 'block-end': {
+        // tool-call 完整入参在 block-end.block；立刻记 step，再靠 snapshotEvents 回填结果
+        const block = chunk.block;
+        if (block?.type === 'tool-call' || chunk.blockType === 'tool-call') {
+          const callId = block?.id || chunk.id || cryptoRandomId();
+          const toolName = block?.name || 'tool';
+          const args = block?.arguments ?? '';
+          recordStep(round.threadId, round.messageId, {
+            id: callId,
+            tool: toolName,
+            input: args,
+            observation: '',
+            latency: 0,
+          });
+          if (!round.toolCallAt) round.toolCallAt = new Map();
+          if (!round.toolFilled) round.toolFilled = new Set();
+          round.toolCallAt.set(callId, Date.now());
+          ensureToolPoll(round);
+          pushProgress(
+            round.peerSession,
+            round.threadId,
+            round.accountId,
+            round.messageId,
+            round.messageId,
+          );
+        }
+        return;
+      }
       case 'tool-call-delta':
+        // 入参分片仅作降级参考；正式步骤以 block-end 为准（见 Step 1 探测结论）
         return;
       case 'usage':
       case 'finish':
@@ -725,13 +990,31 @@ export function apply(ctx, config) {
     );
     if (!round) return next();                           // 非本插件会话 → 交给下游（GUI 弹窗）
 
-    const approvalId = `a-${approvalSeq++}`;
-    // 平台侧要靠 action / risk_level / payload_digest 落库、路由与防篡改校验
-    const meta = buildApprovalMeta(request);
+    const approvalId = `a-${cryptoRandomId().slice(0, 12)}`;
+    // DSH approval/request 不带 args；用 callId 从本轮 session 事件取真实 tool/call.arguments
+    let realArgs = null;
+    try {
+      const events = agent?.session?.snapshotEvents?.(round.startSeq) ?? [];
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i];
+        if (ev?.type !== 'tool/call') continue;
+        if (String(ev.data?.callId ?? '') !== String(request.callId ?? '')) continue;
+        const raw = ev.data?.arguments;
+        if (typeof raw === 'string' && raw.trim()) {
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) realArgs = parsed;
+          } catch { /* 解析失败退回 null，走 reason 兜底 */ }
+        }
+        break;
+      }
+    } catch (e) {
+      trace('审批入参读取失败: ' + (e?.message ?? e));
+    }
+    // 平台侧要靠 action / risk_level / payload / payload_digest 落库、路由与防篡改校验
+    const meta = buildApprovalMeta(request, realArgs);
     const title = meta.title || request.title || request.reason || request.toolName || request.callId || '需要授权的操作';
     log(`审批 ${approvalId}: action=${meta.action} risk=${meta.risk_level} digest=${meta.payload_digest} title=${title}`);
-
-    round.stream.push(`\n⚠️ 需要授权：${title}\n`);
 
     // 用 reply 协议推给 App（status 之外的自定义载荷，客户端可识别 approval 字段）
     // 只带 approval：不带 text / message_id，避免覆盖同一条主回复气泡
@@ -741,6 +1024,7 @@ export function apply(ctx, config) {
         title,
         action: meta.action,
         risk_level: meta.risk_level,
+        payload: meta.payload,             // 平台 preview 看 command/cwd
         payload_digest: meta.payload_digest,
         options: [
           { option_id: 'allow-once', kind: 'allow_once', name: '允许一次' },
@@ -957,7 +1241,28 @@ export function apply(ctx, config) {
         text = inboundFile.name || '';
       }
     }
-    if (!text && !inboundFile.url) { trace('丢弃: 无文本内容'); return; }   // §9.2：无文本且无文件时忽略
+    // 平台标准字段：files: [{url, name, media_kind, is_image}]（单聊/群聊都有）
+    const rawFiles = Array.isArray(nested.files) ? nested.files
+      : (Array.isArray(data.files) ? data.files : []);
+    const inboundFiles = [];
+    for (const f of rawFiles) {
+      if (!f || typeof f !== 'object') continue;
+      const u = String(f.url ?? f.file_url ?? '').trim();
+      if (!u) continue;                                  // 过滤空 url
+      inboundFiles.push({
+        url: u,
+        name: String(f.name ?? f.file_name ?? '').trim(),
+        kind: String(f.media_kind ?? f.kind ?? (f.is_image ? 'image' : '')).trim().toLowerCase(),
+      });
+    }
+    // 老的单文件字段（url/file_url/content）也并进来，且保证第一个仍是它（单文件路径不回归）
+    if (inboundFile.url && !inboundFiles.some((f) => f.url === inboundFile.url)) {
+      inboundFiles.unshift({ url: inboundFile.url, name: inboundFile.name, kind });
+    }
+    if (inboundFiles.length) {
+      inboundFile = inboundFiles[0];                     // 第一个附件仍赋给 inboundFile
+    }
+    if (!text && !inboundFile.url && !inboundFiles.length) { trace('丢弃: 无文本内容'); return; }   // §9.2：无文本且无文件时忽略
 
     const msgId = String(data.msg_id ?? nested.message_id ?? nested.msg_id ?? '').trim();
     if (msgId) {
@@ -984,7 +1289,7 @@ export function apply(ctx, config) {
     peerByDevice.set(deviceId, from);
     lastPeer = from;
 
-    log(`收到消息 peer=${from} thread=${threadId}: ${JSON.stringify(text.slice(0, 60))}${inboundFile.url ? ' [含文件]' : ''}`);
+    log(`收到消息 peer=${from} thread=${threadId}: ${JSON.stringify(text.slice(0, 60))}${inboundFiles.length ? ` [含 ${inboundFiles.length} 个文件]` : ''}`);
 
     // ★ 审批决策：#approval <approval_id> <option_id>，命中后回调 resolver，不投给 agent
     const approvalMatch = text.match(/^#approval\s+(\S+)\s+(allow-once|reject-once)\s*$/);
@@ -1014,7 +1319,7 @@ export function apply(ctx, config) {
     }
 
     // 同一线程串行处理（快速连发时保持顺序与上下文）；不阻塞 WS 消息循环
-    void enqueueThreadTask(`${accountId}:${threadId}`, () => handlePrompt({ peer: from, accountId, threadId, text, inboundFile }));
+    void enqueueThreadTask(`${accountId}:${threadId}`, () => handlePrompt({ peer: from, accountId, threadId, text, inboundFile, inboundFiles }));
   }
 
   /**
@@ -1030,14 +1335,14 @@ export function apply(ctx, config) {
    *   deepFreeze(structuredClone({ ...input, id: randomUUID() }))
    * 所以本插件直接构造等价对象，不 import 内部包（保持零依赖）。
    */
-  async function handlePrompt({ peer, accountId, threadId, text, inboundFile }) {
+  async function handlePrompt({ peer, accountId, threadId, text, inboundFile, inboundFiles }) {
     const messageId = cryptoRandomId();
     const stream = makeStream(peer, threadId, messageId, accountId);
     sendTyping(peer, threadId, accountId);
 
-    // ★ 入站文件：协议字段 url 或 App 拼进文本的文件链接 → 下载到本地，路径交给 agent
+    // ★ 入站文件：files 数组 / 单文件字段 / 文本里的 markdown 链接 → 下载到本地，路径交给 agent
     let agentText = text;
-    try { agentText = await inlineInboundFiles(text, inboundFile); }
+    try { agentText = await inlineInboundFiles(text, inboundFiles ?? inboundFile); }
     catch (e) { warn('处理入站文件失败: ' + (e?.message ?? e)); }
 
     let round = null;
@@ -1056,7 +1361,21 @@ export function apply(ctx, config) {
       const { agent, sessionId, mode } = await acquireAgent({ agents, key, cwd });
       trace(`线程 ${key} → 会话 ${sessionId}（${mode}）`);
 
-      round = { peerSession: peer, accountId, threadId, messageId, stream, agent };
+      const startSeq = agent.session?.seq ?? 0;     // 本轮事件起点（工具回填 + 出站文件）
+      round = {
+        peerSession: peer,
+        accountId,
+        threadId,
+        messageId,
+        stream,
+        agent,
+        startSeq,
+        reasoning: '',
+        toolCallAt: new Map(),
+        toolFilled: new Set(),
+        toolPoll: null,
+        progressDone: false,
+      };
       ownedAgents.set(agent, round);                // ★ 让 assistant-stream / approval 认得出这是我们的会话
 
       await agent.whenIdle?.();
@@ -1069,13 +1388,20 @@ export function apply(ctx, config) {
         source: Object.freeze({ kind: 'user' }),
       });
 
-      const startSeq = agent.session?.seq ?? 0;     // 本轮事件起点（出站文件收集用）
       const roundStartMs = Date.now();
       agent.followup(message);                      // ★ 就是这一步：投递并触发一轮
       log(`已投递 prompt 给 agent，等待完成…`);
 
       await agent.whenIdle?.();                     // 等本轮结束
-      stream.finish();
+      // finish 前停轮询，避免 done 后再发进度帧
+      stopToolPoll(round);
+      round.progressDone = true;
+      const steps = drainSteps(threadId, messageId);
+      const doneExtra = {
+        ...(steps.length ? { tool_events: steps, agent_thoughts: steps } : {}),
+        ...(round.reasoning ? { reasoning: round.reasoning } : {}),
+      };
+      stream.finish(doneExtra);
       // ★ 把本轮的交付文件发给手机（present 事件 + 文本链接），失败不影响主流程
       await deliverRoundFiles({ agent, peer, threadId, accountId, startSeq, roundStartMs, roundText: stream.getText() });
       // 立即把会话刷盘，保证聊天记录可靠落盘（headless 同款做法）
@@ -1083,20 +1409,27 @@ export function apply(ctx, config) {
       log(`本轮完成 peer=${peer} thread=${threadId}`);
     } catch (err) {
       warn('处理 prompt 失败:', err?.message);
+      if (round) {
+        stopToolPoll(round);
+        round.progressDone = true;
+      }
+      drainSteps(threadId, messageId);
       stream.finish();
       sendReply(peer, threadId, {
         text: `[DSH 插件错误] ${err?.message ?? err}`,
         message_id: messageId,
-        delta: true,
         done: true,
       }, accountId);
     } finally {
+      if (round) {
+        stopToolPoll(round);
+        round.progressDone = true;
+      }
       if (round?.agent && ownedAgents.get(round.agent) === round) ownedAgents.delete(round.agent);
     }
   }
 
   const safeJson = (s) => { try { const v = JSON.parse(s); return v && typeof v === 'object' ? v : {}; } catch { return {}; } };
-  const cryptoRandomId = () => globalThis.crypto?.randomUUID?.() ?? `m-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   // ───────────────────────── 启动 / 清理 ─────────────────────────
   //
