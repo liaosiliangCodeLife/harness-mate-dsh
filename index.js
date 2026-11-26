@@ -421,6 +421,21 @@ export function apply(ctx, config) {
   /** approvalId → resolver */
   const approvals = new Map();
 
+  /** 活跃轮次：有登记才发心跳；空闲时一条帧都不发 */
+  const activeRounds = new Map();   // `${accountId}:${threadId}` → { peer, threadId, accountId }
+  setInterval(() => {
+    for (const round of activeRounds.values()) {
+      try {
+        sendReply(round.peer, round.threadId, {
+          text: '',
+          status: 'running',
+          heartbeat: true,
+          done: false,
+        }, round.accountId);
+      } catch { /* 心跳失败不影响主流程 */ }
+    }
+  }, 30000);
+
   /**
    * 解析上传所需的 thread_id（对齐 Hermes 0.6.2 出站兜底）：
    *   入参 threadId → ownedAgents 同 peer 的 threadId → replyTargets 反查。
@@ -1377,6 +1392,14 @@ export function apply(ctx, config) {
         progressDone: false,
       };
       ownedAgents.set(agent, round);                // ★ 让 assistant-stream / approval 认得出这是我们的会话
+      // 运行态心跳：peer/threadId 就绪后登记，立刻补一帧，再每 30s 续期
+      activeRounds.set(key, { peer, threadId, accountId });
+      sendReply(peer, threadId, {
+        text: '',
+        status: 'running',
+        heartbeat: true,
+        done: false,
+      }, accountId);
 
       await agent.whenIdle?.();
 
@@ -1401,6 +1424,8 @@ export function apply(ctx, config) {
         ...(steps.length ? { tool_events: steps, agent_thoughts: steps } : {}),
         ...(round.reasoning ? { reasoning: round.reasoning } : {}),
       };
+      // 先摘活跃登记再发 done：顺序反了心跳会把状态重新点亮
+      activeRounds.delete(key);
       stream.finish(doneExtra);
       // ★ 把本轮的交付文件发给手机（present 事件 + 文本链接），失败不影响主流程
       await deliverRoundFiles({ agent, peer, threadId, accountId, startSeq, roundStartMs, roundText: stream.getText() });
@@ -1414,6 +1439,7 @@ export function apply(ctx, config) {
         round.progressDone = true;
       }
       drainSteps(threadId, messageId);
+      activeRounds.delete(`${accountId}:${threadId}`);
       stream.finish();
       sendReply(peer, threadId, {
         text: `[DSH 插件错误] ${err?.message ?? err}`,
@@ -1421,6 +1447,8 @@ export function apply(ctx, config) {
         done: true,
       }, accountId);
     } finally {
+      // 兜底摘登记（与 try/catch 里的 delete 幂等）
+      activeRounds.delete(`${accountId}:${threadId}`);
       if (round) {
         stopToolPoll(round);
         round.progressDone = true;
